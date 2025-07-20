@@ -1,0 +1,1830 @@
+import sys
+import time
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from bs4 import BeautifulSoup
+from sqlalchemy import create_engine, text
+import logging
+import traceback
+from typing import List, Dict, Optional, Tuple
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QLineEdit, QPushButton, QRadioButton, QCheckBox, 
+                            QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, 
+                            QMessageBox, QGroupBox, QTabWidget, QSplitter, QComboBox,
+                            QDateEdit, QSpinBox, QFormLayout, QTextEdit, QFileDialog)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDate
+
+# 配置日誌
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('taiwan_stock_data.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 顏色方案 - 深色藍色主題
+COLORS = {
+    'bg_dark': "#1E1E2E",           # 深色背景
+    'bg_medium': "#313244",         # 中等深度背景
+    'bg_light': "#45475A",          # 較淺背景
+    'text_light': "#CDD6F4",        # 淺色文字
+    'text_dim': "#BAC2DE",          # 稍暗文字
+    'accent': "#89B4FA",            # 主要強調色 - 藍色
+    'accent_alt': "#74C7EC",        # 次要強調色 - 淺藍色
+    'success': "#A6E3A1",           # 成功指示色 - 綠色
+    'error': "#F38BA8",             # 錯誤指示色 - 紅色
+    'warning': "#FAB387",           # 警告指示色 - 橙色
+    'neutral': "#94E2D5",           # 中性指示色 - 青色
+}
+
+class StockDataUpdater(QThread):
+    """用於更新台灣股票數據的工作線程"""
+    progress_update = pyqtSignal(int, str)
+    error_occurred = pyqtSignal(str)
+    result_ready = pyqtSignal(dict)
+    
+    def __init__(self, db_config: Dict, update_mode: str = 'incremental', 
+                 update_prices: bool = True, update_returns: bool = True,
+                 symbol_range: Tuple[str, str] = None):
+        """
+        初始化股票數據更新工作線程
+        
+        Args:
+            db_config: 資料庫連接配置字典
+            update_mode: 更新模式 ('incremental'=增量更新, 'full'=全量更新)
+            update_prices: 是否更新股價數據
+            update_returns: 是否更新報酬率數據
+            symbol_range: 股票代碼範圍 (起始代碼, 結束代碼) 或 None表示全部
+        """
+        super().__init__()
+        self.db_config = db_config
+        self.update_mode = update_mode
+        self.update_prices = update_prices
+        self.update_returns = update_returns
+        self.symbol_range = symbol_range
+        self.should_stop = False
+        self.symbols_list = []  # 保存抓取到的股票列表供後續使用
+        
+    def stop(self):
+        """設置停止標誌以中斷任務"""
+        self.should_stop = True
+    
+    def run(self):
+        """執行股票數據更新任務"""
+        try:
+            start_time = time.time()  # 記錄開始時間
+            
+            self.progress_update.emit(5, "正在連接資料庫...")
+            # 構建資料庫連接字符串
+            db_uri = f"postgresql://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
+            engine = create_engine(db_uri)
+
+            if not self.test_connection(engine):
+                self.error_occurred.emit("無法連接到資料庫，請檢查連接設定")
+                return
+            
+            # 1. 準備資料庫表（如果不存在）
+            self.progress_update.emit(8, "準備資料庫表...")
+            self.prepare_database_tables(engine)
+            
+            # 2. 抓取股票代碼列表
+            self.progress_update.emit(10, "抓取台灣股票代碼...")
+            symbols_df = self.fetch_all_taiwan_symbols()
+            if symbols_df.empty:
+                self.error_occurred.emit("未能抓取到股票代碼")
+                return
+                
+            # 如果指定了股票代碼範圍，過濾符合範圍的股票
+            if self.symbol_range and len(self.symbol_range) == 2:
+                start_code, end_code = self.symbol_range
+                # 從股票代碼中提取數字部分進行比較
+                symbols_df['code_num'] = symbols_df['symbol'].apply(
+                    lambda x: int(x.split('.')[0]) if x.split('.')[0].isdigit() else 0
+                )
+                start_num = int(start_code) if start_code.isdigit() else 0
+                end_num = int(end_code) if end_code.isdigit() else 9999
+                
+                symbols_df = symbols_df[
+                    (symbols_df['code_num'] >= start_num) & 
+                    (symbols_df['code_num'] <= end_num)
+                ]
+                symbols_df = symbols_df.drop('code_num', axis=1)
+                
+                if symbols_df.empty:
+                    self.error_occurred.emit(f"指定範圍 {start_code} 至 {end_code} 內沒有找到股票")
+                    return
+            
+            # 保存股票列表供UI顯示和後續使用
+            self.symbols_list = symbols_df.to_dict('records')
+            
+            # 3. 更新股票價格數據
+            prices_updated = False
+            if self.update_prices:
+                self.progress_update.emit(15, "開始更新股價數據...")
+                prices_updated = self.update_stock_prices(engine, symbols_df)
+            
+            # 4. 更新報酬率數據
+            if self.update_returns:
+                if prices_updated or not self.update_prices:  # 如果剛更新了股價或只更新報酬率
+                    self.progress_update.emit(85, "開始計算報酬率...")
+                    self.update_stock_returns(engine)
+            
+            # 5. 計算執行時間並發送結果
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            
+            self.progress_update.emit(100, "數據更新完成!")
+            result_data = {
+                'symbols': self.symbols_list,
+                'elapsed_time': elapsed_time,
+                'update_mode': self.update_mode,
+                'prices_updated': prices_updated,
+                'returns_updated': self.update_returns
+            }
+            self.result_ready.emit(result_data)
+            
+        except Exception as e:
+            error_msg = f"股票數據更新過程中發生錯誤: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            self.error_occurred.emit(error_msg)
+    
+    def test_connection(self, engine) -> bool:
+        """測試資料庫連接"""
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        except Exception as e:
+            logger.error(f"資料庫連接測試失敗: {e}")
+            return False
+            
+    def update_stock_prices(self, engine, symbols_df) -> bool:
+        """更新股票價格數據"""
+        try:
+            total_symbols = len(symbols_df)
+            updated_count = 0
+            error_count = 0
+            skipped_count = 0
+            
+            for i, row in symbols_df.iterrows():
+                if self.should_stop:
+                    self.progress_update.emit(50, "任務已手動停止")
+                    return False
+                    
+                symbol = row['symbol']
+                name = row['name']
+                
+                progress = 15 + (i / total_symbols) * 65  # 進度百分比從15%到80%
+                self.progress_update.emit(int(progress), f"更新股價 ({i+1}/{total_symbols}): {symbol} {name}")
+                
+                try:
+                    # 查詢該股票在資料庫中的最新日期
+                    if self.update_mode == 'incremental':
+                        query = text('SELECT MAX("Date") FROM taiwan_stock_prices WHERE ticker = :symbol')
+                        result = pd.read_sql(query, engine, params={"symbol": symbol})
+                        max_date = result.iloc[0, 0]
+                        
+                        if pd.isnull(max_date):
+                            start_date = "2010-01-01"  # 設定一個預設的開始日期
+                        else:
+                            # 從最新日期的下一天開始下載
+                            start_date = (pd.to_datetime(max_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                            
+                        # 檢查是否需要更新（如果最新日期是今天，則跳過）
+                        today = pd.to_datetime("today").normalize()
+                        if max_date is not None and pd.to_datetime(max_date).normalize() >= today:
+                            self.progress_update.emit(int(progress), f"跳過 {symbol} {name} - 已是最新")
+                            skipped_count += 1
+                            continue
+                    else:
+                        # 全量更新模式
+                        start_date = "2010-01-01"
+                    
+                    # 下載股票數據
+                    self.progress_update.emit(int(progress), f"下載 {symbol} {name} 從 {start_date} 開始的數據")
+                    df_new = self.fetch_stock_data(symbol, start_date)
+                    
+                    if df_new is None or df_new.empty:
+                        self.progress_update.emit(int(progress), f"跳過 {symbol} {name} - 無新數據")
+                        skipped_count += 1
+                        continue
+                    
+                    # 存入資料庫
+                    if self.update_mode == 'incremental':
+                        # 增量更新: 追加新數據
+                        df_new.to_sql('taiwan_stock_prices', con=engine, if_exists='append', index=False)
+                    else:
+                        # 全量更新: 先刪除該股票的所有數據，再寫入新數據
+                        with engine.connect() as conn:
+                            conn.execute(text("DELETE FROM taiwan_stock_prices WHERE ticker = :symbol"), {"symbol": symbol})
+                        df_new.to_sql('taiwan_stock_prices', con=engine, if_exists='append', index=False)
+                    
+                    updated_count += 1
+                    self.progress_update.emit(int(progress), f"完成 {symbol} {name} 的股價更新")
+                    
+                except Exception as e:
+                    error_msg = f"更新 {symbol} 股價時發生錯誤: {str(e)}"
+                    self.progress_update.emit(int(progress), error_msg)
+                    error_count += 1
+                    logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            
+            self.progress_update.emit(80, f"股價更新完成: 更新 {updated_count} 檔, 跳過 {skipped_count} 檔, 錯誤 {error_count} 檔")
+            
+            # 將更新統計添加到 symbols_list
+            self.symbols_list.append({
+                'symbol': '統計',
+                'name': f'更新:{updated_count} 跳過:{skipped_count} 錯誤:{error_count}'
+            })
+            
+            return updated_count > 0 or self.update_mode == 'full'
+            
+        except Exception as e:
+            error_msg = f"股價數據更新過程中發生錯誤: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            self.error_occurred.emit(error_msg)
+            return False
+    
+    def update_stock_returns(self, engine):
+        """更新股票報酬率數據"""
+        try:
+            self.progress_update.emit(85, "從資料庫讀取股價數據...")
+            
+            # 如果指定了股票範圍且是增量更新，只計算指定範圍的報酬率
+            if self.symbol_range and len(self.symbol_range) == 2 and self.update_mode == 'incremental':
+                start_code, end_code = self.symbol_range
+                start_num = int(start_code) if start_code.isdigit() else 0
+                end_num = int(end_code) if end_code.isdigit() else 9999
+                
+                where_clause = f"""
+                WHERE CAST(SUBSTRING(ticker FROM 1 FOR POSITION('.' IN ticker) - 1) AS INTEGER) 
+                BETWEEN {start_num} AND {end_num}
+                """
+                prices_query = f"SELECT * FROM taiwan_stock_prices {where_clause}"
+            else:
+                prices_query = "SELECT * FROM taiwan_stock_prices"
+            
+            prices_df = pd.read_sql(prices_query, engine)
+            
+            if prices_df.empty:
+                self.progress_update.emit(90, "沒有找到股價數據，無法計算報酬率")
+                return
+            
+            self.progress_update.emit(90, f"計算 {prices_df['ticker'].nunique()} 檔股票的報酬率...")
+            
+            # 計算報酬率
+            returns_df = self.compute_all_returns(prices_df)
+            
+            # 根據更新模式處理報酬率數據
+            if self.update_mode == 'full':
+                # 全量更新: 替換整個表
+                self.progress_update.emit(95, "全量更新報酬率數據...")
+                returns_df.to_sql('taiwan_stock_returns', con=engine, if_exists='replace', index=False)
+            else:
+                # 增量更新: 先刪除涉及的股票的報酬率，再寫入新計算的報酬率
+                self.progress_update.emit(95, "增量更新報酬率數據...")
+                with engine.connect() as conn:
+                    for ticker in returns_df['ticker'].unique():
+                        conn.execute(text("DELETE FROM taiwan_stock_returns WHERE ticker = :ticker"), {"ticker": ticker})
+                
+                returns_df.to_sql('taiwan_stock_returns', con=engine, if_exists='append', index=False)
+            
+            self.progress_update.emit(98, f"報酬率更新完成: {len(returns_df)} 筆報酬率數據")
+            
+        except Exception as e:
+            error_msg = f"報酬率更新過程中發生錯誤: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            self.error_occurred.emit(error_msg)
+    
+    def compute_all_returns(self, prices_df):
+        """計算所有股票的報酬率"""
+        # 分組計算，每個 ticker 一組
+        grouped = prices_df.groupby('ticker')
+        results = []
+        
+        total_tickers = len(grouped.groups)
+        processed_count = 0
+        error_count = 0
+        
+        for ticker, group in grouped:
+            if self.should_stop:
+                self.progress_update.emit(int(95), f"任務已手動停止，已處理 {processed_count}/{total_tickers} 檔股票")
+                break
+                
+            # 更新進度
+            progress = 90 + (processed_count / total_tickers) * 5
+            self.progress_update.emit(int(progress), f"計算報酬率 ({processed_count+1}/{total_tickers}): {ticker}")
+            
+            try:
+                ret_df = self.compute_returns_for_ticker(group)
+                results.append(ret_df)
+                processed_count += 1
+                self.progress_update.emit(int(progress), f"完成計算報酬率 ({processed_count}/{total_tickers}): {ticker}")
+            except Exception as e:
+                error_msg = f"計算 {ticker} 報酬率時發生錯誤: {e}"
+                logger.error(error_msg)
+                self.progress_update.emit(int(progress), error_msg)
+                error_count += 1
+                processed_count += 1
+                continue
+        
+        # 最終進度更新
+        if processed_count == total_tickers:
+            self.progress_update.emit(95, f"報酬率計算完成: 共 {processed_count} 檔，成功 {processed_count-error_count} 檔，失敗 {error_count} 檔")
+        
+        all_returns = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+        return all_returns
+        
+    def compute_returns_for_ticker(self, group):
+        """對單一股票計算各種時間尺度的報酬率"""
+        try:
+            # 確保日期為 datetime 並排序
+            group['Date'] = pd.to_datetime(group['Date'])
+            group = group.sort_values('Date')
+            
+            # 如果數據少於 2 筆，無法計算報酬率
+            if len(group) < 2:
+                logger.warning(f"{group['ticker'].iloc[0]} 數據不足，無法計算報酬率")
+                return pd.DataFrame()  # 返回空 DataFrame
+            
+            # 日報酬率（每天的百分比變化）
+            daily = group.copy()
+            daily['return'] = daily['Close'].pct_change()
+            daily = daily.dropna(subset=['return'])
+            daily = daily[['Date', 'return']].copy()
+            daily['frequency'] = 'daily'
+            
+            # 週報酬率：以每週最後一個交易日的收盤價計算
+            weekly = group.set_index('Date')['Close'].resample('W').last().pct_change().dropna().reset_index()
+            weekly.rename(columns={'Close': 'return'}, inplace=True)
+            weekly['frequency'] = 'weekly'
+            
+            # 月報酬率
+            monthly = group.set_index('Date')['Close'].resample('M').last().pct_change().dropna().reset_index()
+            monthly.rename(columns={'Close': 'return'}, inplace=True)
+            monthly['frequency'] = 'monthly'
+            
+            # 季報酬率
+            quarterly = group.set_index('Date')['Close'].resample('Q').last().pct_change().dropna().reset_index()
+            quarterly.rename(columns={'Close': 'return'}, inplace=True)
+            quarterly['frequency'] = 'quarterly'
+            
+            # 年報酬率
+            yearly = group.set_index('Date')['Close'].resample('A').last().pct_change().dropna().reset_index()
+            yearly.rename(columns={'Close': 'return'}, inplace=True)
+            yearly['frequency'] = 'yearly'
+            
+            # 合併所有頻率的報酬率
+            combined = pd.concat([daily, weekly, monthly, quarterly, yearly], ignore_index=True)
+            combined['ticker'] = group['ticker'].iloc[0]
+            # 調整欄位順序
+            combined = combined[['ticker', 'Date', 'frequency', 'return']]
+            return combined
+            
+        except Exception as e:
+            logger.error(f"計算報酬率過程中發生錯誤: {str(e)}\n{traceback.format_exc()}")
+            raise  # 重新拋出異常，讓上層函式處理
+
+
+
+    
+
+    def fetch_twse_symbols(self) -> List[Dict]:
+        """抓取台灣上市公司股票代碼"""
+        url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=2'
+        response = requests.get(url)
+        response.encoding = 'big5'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 嘗試根據 class 來定位表格（新版可能有變動）
+        table = soup.find('table', {'class': 'h4'})
+        if not table:
+            tables = soup.find_all('table')
+            if tables:
+                table = tables[0]
+            else:
+                logger.error("未找到上市股票的表格")
+                return []
+        
+        rows = table.find_all('tr')[1:]  # 跳過標題行
+        symbols = []
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) > 1 and cols[0].text.strip():
+                code_name = cols[0].text.strip().split()
+                if len(code_name) >= 2 and code_name[0].isdigit():
+                    symbols.append({'symbol': code_name[0] + '.TW', 'name': code_name[1]})
+        
+        logger.info(f"取得 {len(symbols)} 檔上市股票")
+        return symbols
+
+    def fetch_otc_symbols(self) -> List[Dict]:
+        """抓取台灣櫃檯買賣中心股票代碼"""
+        url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=4'
+        response = requests.get(url)
+        response.encoding = 'big5'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        table = soup.find('table', {'class': 'h4'})
+        if not table:
+            tables = soup.find_all('table')
+            if tables:
+                table = tables[0]
+            else:
+                logger.error("未找到櫃檯股票的表格")
+                return []
+        
+        rows = table.find_all('tr')[1:]
+        symbols = []
+        for row in rows:
+            cols = row.find_all('td')
+            if len(cols) > 1 and cols[0].text.strip():
+                code_name = cols[0].text.strip().split()
+                if len(code_name) >= 2 and code_name[0].isdigit():
+                    symbols.append({'symbol': code_name[0] + '.TWO', 'name': code_name[1]})
+        
+        logger.info(f"取得 {len(symbols)} 檔櫃檯股票")
+        return symbols
+
+    def fetch_all_taiwan_symbols(self) -> pd.DataFrame:
+        """抓取並合併所有台灣股票代碼"""
+        twse_symbols = self.fetch_twse_symbols()
+        otc_symbols = self.fetch_otc_symbols()
+        all_symbols_df = pd.DataFrame(twse_symbols + otc_symbols)
+        
+        if all_symbols_df.empty:
+            return pd.DataFrame()
+            
+        # 過濾掉 name 欄位中包含「購」和「牛熊證」的資料
+        filtered_df = all_symbols_df[
+            ~all_symbols_df['name'].str.contains('購', na=False) & 
+            ~all_symbols_df['name'].str.contains('牛熊證', na=False)
+        ]
+        logger.info(f"總共取得 {len(filtered_df)} 檔股票（已過濾含「購」和「牛熊證」的資料）")
+        return filtered_df
+
+    def fetch_stock_data(self, symbol, start_date="2010-01-01") -> Optional[pd.DataFrame]:
+        """下載單一股票的歷史股價數據"""
+        try:
+            df = yf.download(symbol, start=start_date)
+            if df.empty:
+                logger.warning(f"{symbol} 沒有可用的數據")
+                return None
+                
+            # 若為 MultiIndex，移除第二層
+            df.columns = df.columns.droplevel(1) if isinstance(df.columns, pd.MultiIndex) else df.columns
+            df.insert(0, "ticker", symbol)  # 加入 ticker 欄位
+            df.reset_index(inplace=True)    # 讓 Date 變成普通欄位
+            return df
+        except Exception as e:
+            logger.error(f"無法下載 {symbol}: {e}")
+            return None
+    
+    def prepare_database_tables(self, engine):
+        """確保必要的資料表存在"""
+        try:
+            # 使用 with 語句創建連接並執行 SQL
+            with engine.connect() as conn:
+                # 檢查並創建股價表
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS taiwan_stock_prices (
+                    ticker VARCHAR(20),
+                    "Date" DATE,
+                    "Open" FLOAT,
+                    "High" FLOAT,
+                    "Low" FLOAT,
+                    "Close" FLOAT,
+                    "Volume" BIGINT,
+                    PRIMARY KEY (ticker, "Date")
+                );
+                """))
+                
+                # 檢查並創建報酬率表
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS taiwan_stock_returns (
+                    ticker VARCHAR(20),
+                    "Date" DATE,
+                    frequency VARCHAR(10),
+                    "return" FLOAT,
+                    PRIMARY KEY (ticker, "Date", frequency)
+                );
+                """))
+                
+                # 提交事務
+                #conn.commit()
+                
+            logger.info("資料庫表結構確認完成")
+            
+        except Exception as e:
+            logger.error(f"準備資料庫表時發生錯誤: {e}")
+            raise
+
+
+class StyledButton(QPushButton):
+    """具有科技感的按鈕"""
+    def __init__(self, text, parent=None, accent=False, warning=False):
+        super(StyledButton, self).__init__(text, parent)
+        
+        # 設置基本樣式
+        self.setMinimumHeight(36)
+        self.setCursor(Qt.PointingHandCursor)  # 使用手型游標增加互動感
+        
+        # 設置不同類型的按鈕樣式
+        if accent:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['accent']};
+                    color: {COLORS['bg_dark']};
+                    font-weight: bold;
+                    border: none;
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{
+                    background-color: {COLORS['accent_alt']};
+                }}
+                QPushButton:pressed {{
+                    background-color: {COLORS['accent']};
+                    padding: 10px 16px 6px 16px;
+                }}
+                QPushButton:disabled {{
+                    background-color: {COLORS['bg_light']};
+                    color: {COLORS['text_dim']};
+                }}
+            """)
+        elif warning:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['warning']};
+                    color: {COLORS['bg_dark']};
+                    font-weight: bold;
+                    border: none;
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{
+                    background-color: {COLORS['error']};
+                }}
+                QPushButton:pressed {{
+                    background-color: {COLORS['warning']};
+                    padding: 10px 16px 6px 16px;
+                }}
+                QPushButton:disabled {{
+                    background-color: {COLORS['bg_light']};
+                    color: {COLORS['text_dim']};
+                }}
+            """)
+        else:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['bg_medium']};
+                    color: {COLORS['text_light']};
+                    border: 1px solid {COLORS['bg_light']};
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{
+                    background-color: {COLORS['bg_light']};
+                    border: 1px solid {COLORS['accent']};
+                }}
+                QPushButton:pressed {{
+                    background-color: {COLORS['bg_medium']};
+                    padding: 10px 16px 6px 16px;
+                }}
+                QPushButton:disabled {{
+                    background-color: {COLORS['bg_dark']};
+                    color: {COLORS['text_dim']};
+                    border: 1px solid {COLORS['bg_medium']};
+                }}
+            """)
+
+
+class StyledProgressBar(QProgressBar):
+    """具有科技感的進度條"""
+    def __init__(self, parent=None):
+        super(StyledProgressBar, self).__init__(parent)
+        self.setTextVisible(True)
+        self.setFixedHeight(20)
+        
+        # 設置漸變背景
+        self.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_light']};
+                border: none;
+                border-radius: 10px;
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
+                                            stop:0 {COLORS['accent']}, 
+                                            stop:1 {COLORS['accent_alt']});
+                border-radius: 10px;
+            }}
+        """)
+
+
+class MainWindow(QMainWindow):
+    """台灣股票數據更新系統主視窗"""
+    def __init__(self):
+        super().__init__()
+        
+        # 初始化數據庫配置
+        self.db_config = {
+            "host": "localhost",
+            "port": "5432",
+            "user": "postgres",
+            "password": "s8304021",
+            "dbname": "postgres"
+        }
+        
+        self.initUI()
+        
+    def initUI(self):
+        """初始化使用者界面"""
+        self.setWindowTitle("BDStock Nexus")
+        self.setGeometry(100, 100, 1000, 700)
+        
+        # 設置應用程式樣式
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_light']};
+            }}
+            QLabel {{
+                color: {COLORS['text_light']};
+            }}
+            QGroupBox {{
+                border: 1px solid {COLORS['bg_light']};
+                border-radius: 5px;
+                margin-top: 20px;
+                font-weight: bold;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QTableWidget {{
+                background-color: {COLORS['bg_medium']};
+                alternate-background-color: {COLORS['bg_light']};
+                gridline-color: {COLORS['bg_light']};
+            }}
+            QTableWidget::item {{
+                padding: 4px;
+            }}
+            QTableWidget::item:selected {{
+                background-color: {COLORS['accent']};
+                color: {COLORS['bg_dark']};
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_light']};
+                padding: 5px;
+                border: none;
+            }}
+            QLineEdit, QDateEdit, QComboBox, QSpinBox {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_light']};
+                border: 1px solid {COLORS['bg_light']};
+                border-radius: 3px;
+                padding: 5px;
+            }}
+            QRadioButton, QCheckBox {{
+                color: {COLORS['text_light']};
+                spacing: 5px;
+            }}
+            QRadioButton::indicator, QCheckBox::indicator {{
+                width: 15px;
+                height: 15px;
+            }}
+            QTextEdit {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_light']};
+                border: 1px solid {COLORS['bg_light']};
+                border-radius: 3px;
+            }}
+            QScrollBar {{
+                background-color: {COLORS['bg_medium']};
+                border-radius: 5px;
+            }}
+            QScrollBar::handle {{
+                background-color: {COLORS['bg_light']};
+                border-radius: 5px;
+            }}
+        """)
+        
+        # 主視窗佈局
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # 標題區域
+        title_label = QLabel("BDStock Nexus")
+        title_label.setStyleSheet(f"""
+            font-size: 24px;
+            color: {COLORS['accent']};
+            font-weight: bold;
+            padding: 10px;
+            border-bottom: 1px solid {COLORS['bg_light']};
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title_label)
+        
+        # 主內容區域（分割器）
+        content_splitter = QSplitter(Qt.Vertical)
+        
+        # 上半部：標籤頁
+        tabs = QTabWidget()
+        tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {COLORS['bg_light']};
+            }}
+            QTabBar::tab {{
+                background-color: {COLORS['bg_medium']};
+                padding: 8px 12px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {COLORS['accent']};
+                color: {COLORS['bg_dark']};
+                font-weight: bold;
+            }}
+            QTabBar::tab:!selected:hover {{
+                background-color: {COLORS['bg_light']};
+            }}
+        """)
+        
+        # 更新標籤頁
+        update_tab = self.create_update_tab()
+        tabs.addTab(update_tab, "資料更新")
+        
+        # 查詢標籤頁
+        query_tab = self.create_query_tab()
+        tabs.addTab(query_tab, "資料查詢")
+        
+        # 統計標籤頁
+        stats_tab = self.create_stats_tab()
+        tabs.addTab(stats_tab, "資料統計")
+        
+        # 設定標籤頁
+        settings_tab = self.create_settings_tab()
+        tabs.addTab(settings_tab, "系統設定")
+        
+        # 下半部：日誌區域
+        log_group = QGroupBox("執行日誌")
+        log_layout = QVBoxLayout(log_group)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(150)
+        
+        log_buttons = QHBoxLayout()
+        clear_log_btn = StyledButton("清除日誌")
+        clear_log_btn.clicked.connect(self.clear_log)
+        export_log_btn = StyledButton("導出日誌")
+        export_log_btn.clicked.connect(self.export_log)
+        
+        log_buttons.addWidget(clear_log_btn)
+        log_buttons.addWidget(export_log_btn)
+        log_buttons.addStretch()
+        
+        log_layout.addWidget(self.log_text)
+        log_layout.addLayout(log_buttons)
+        
+        # 將上下兩部分加入分割器
+        content_splitter.addWidget(tabs)
+        content_splitter.addWidget(log_group)
+        
+        # 設置分割比例 (70%:30%)
+        content_splitter.setSizes([int(self.height() * 0.7), int(self.height() * 0.3)])
+        
+        # 添加分割器到主佈局
+        main_layout.addWidget(content_splitter)
+        
+        # 初始化並顯示
+        self.add_log_message("系統已啟動")
+        self.check_database_connection()
+    
+    def create_update_tab(self):
+        """創建資料更新標籤頁"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # 資料庫連接狀態
+        self.db_status_label = QLabel("資料庫狀態: 檢查中...")
+        self.db_status_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 5px; border: 1px solid {COLORS['bg_light']}; border-radius: 3px;")
+        layout.addWidget(self.db_status_label)
+        
+        # 更新選項區域
+        options_group = QGroupBox("更新選項")
+        options_layout = QVBoxLayout(options_group)
+        
+        # 更新模式
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("更新模式:")
+        self.mode_incremental = QRadioButton("增量更新 (只下載新數據)")
+        self.mode_incremental.setChecked(True)
+        self.mode_full = QRadioButton("全量更新 (重新下載所有數據)")
+        
+        mode_layout.addWidget(mode_label)
+        mode_layout.addWidget(self.mode_incremental)
+        mode_layout.addWidget(self.mode_full)
+        mode_layout.addStretch()
+        
+        # 更新內容
+        content_layout = QHBoxLayout()
+        content_label = QLabel("更新內容:")
+        self.update_prices_check = QCheckBox("股價數據")
+        self.update_prices_check.setChecked(True)
+        self.update_returns_check = QCheckBox("報酬率數據")
+        self.update_returns_check.setChecked(True)
+        
+        content_layout.addWidget(content_label)
+        content_layout.addWidget(self.update_prices_check)
+        content_layout.addWidget(self.update_returns_check)
+        content_layout.addStretch()
+        
+        # 股票範圍
+        range_group = QGroupBox("股票範圍")
+        range_layout = QVBoxLayout(range_group)
+        
+        self.all_stocks_radio = QRadioButton("更新所有股票")
+        self.all_stocks_radio.setChecked(True)
+        
+        self.range_stocks_radio = QRadioButton("指定股票代碼範圍")
+        range_input_layout = QHBoxLayout()
+        range_from_label = QLabel("從:")
+        self.range_from_input = QLineEdit()
+        self.range_from_input.setPlaceholderText("起始代碼 (如: 1101)")
+        self.range_from_input.setEnabled(False)
+        
+        range_to_label = QLabel("到:")
+        self.range_to_input = QLineEdit()
+        self.range_to_input.setPlaceholderText("結束代碼 (如: 1110)")
+        self.range_to_input.setEnabled(False)
+        
+        range_input_layout.addWidget(range_from_label)
+        range_input_layout.addWidget(self.range_from_input)
+        range_input_layout.addWidget(range_to_label)
+        range_input_layout.addWidget(self.range_to_input)
+        
+        # 連接範圍選項的信號
+        self.all_stocks_radio.toggled.connect(self.toggle_range_inputs)
+        self.range_stocks_radio.toggled.connect(self.toggle_range_inputs)
+        
+        range_layout.addWidget(self.all_stocks_radio)
+        range_layout.addWidget(self.range_stocks_radio)
+        range_layout.addLayout(range_input_layout)
+        
+        # 將所有選項佈局加入到選項組
+        options_layout.addLayout(mode_layout)
+        options_layout.addLayout(content_layout)
+        options_layout.addWidget(range_group)
+        
+        # 按鈕區域
+        buttons_layout = QHBoxLayout()
+        
+        self.update_btn = StyledButton("執行資料更新", accent=True)
+        self.update_btn.setMinimumHeight(40)
+        self.update_btn.clicked.connect(self.execute_update)
+        
+        self.cancel_btn = StyledButton("取消", warning=True)
+        self.cancel_btn.setMinimumHeight(40)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_update)
+        
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.update_btn)
+        buttons_layout.addWidget(self.cancel_btn)
+        buttons_layout.addStretch()
+        
+        # 進度區域
+        progress_group = QGroupBox("執行進度")
+        progress_layout = QVBoxLayout(progress_group)
+        
+        self.progress_bar = StyledProgressBar()
+        self.progress_label = QLabel("就緒")
+        self.progress_label.setAlignment(Qt.AlignCenter)
+        
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_label)
+        
+        # 結果表格
+        result_group = QGroupBox("更新結果")
+        result_layout = QVBoxLayout(result_group)
+        
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(2)
+        self.result_table.setHorizontalHeaderLabels(["股票代碼", "股票名稱"])
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.result_table.setAlternatingRowColors(True)
+        
+        result_layout.addWidget(self.result_table)
+        
+        # 添加各區域到主佈局
+        layout.addWidget(options_group)
+        layout.addLayout(buttons_layout)
+        layout.addWidget(progress_group)
+        layout.addWidget(result_group)
+        
+        return tab
+    
+    def create_query_tab(self):
+        """創建資料查詢標籤頁"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # 查詢選項
+        query_group = QGroupBox("查詢選項")
+        query_layout = QFormLayout(query_group)
+        
+        # 股票代碼輸入
+        self.ticker_input = QLineEdit()
+        self.ticker_input.setPlaceholderText("輸入股票代碼 (如: 2330.TW)")
+        query_layout.addRow("股票代碼:", self.ticker_input)
+        
+        # 日期選擇
+        date_layout = QHBoxLayout()
+        self.start_date = QDateEdit()
+        self.start_date.setDisplayFormat("yyyy-MM-dd")
+        self.start_date.setDate(QDate.currentDate().addYears(-1))
+        self.start_date.setCalendarPopup(True)
+        
+        self.end_date = QDateEdit()
+        self.end_date.setDisplayFormat("yyyy-MM-dd")
+        self.end_date.setDate(QDate.currentDate())
+        self.end_date.setCalendarPopup(True)
+        
+        date_layout.addWidget(self.start_date)
+        date_layout.addWidget(QLabel("至"))
+        date_layout.addWidget(self.end_date)
+        
+        query_layout.addRow("日期範圍:", date_layout)
+        
+        # 報酬率時間尺度
+        self.frequency_combo = QComboBox()
+        self.frequency_combo.addItems(["日報酬率", "週報酬率", "月報酬率", "季報酬率", "年報酬率"])
+        query_layout.addRow("報酬率時間尺度:", self.frequency_combo)
+        
+        # 查詢按鈕
+        query_btn_layout = QHBoxLayout()
+        query_price_btn = StyledButton("查詢股價")
+        query_price_btn.clicked.connect(self.query_price_data)
+        
+        query_return_btn = StyledButton("查詢報酬率")
+        query_return_btn.clicked.connect(self.query_return_data)
+        
+        export_query_btn = StyledButton("導出查詢結果")
+        export_query_btn.clicked.connect(self.export_query_results)
+        
+        query_btn_layout.addWidget(query_price_btn)
+        query_btn_layout.addWidget(query_return_btn)
+        query_btn_layout.addWidget(export_query_btn)
+        query_btn_layout.addStretch()
+        
+        # 查詢結果表格
+        self.query_table = QTableWidget()
+        self.query_table.setAlternatingRowColors(True)
+        
+        # 添加各元素到主佈局
+        layout.addWidget(query_group)
+        layout.addLayout(query_btn_layout)
+        layout.addWidget(self.query_table)
+        
+        return tab
+    
+    def create_stats_tab(self):
+        """創建資料統計標籤頁"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # 資料庫統計
+        stats_group = QGroupBox("資料庫統計")
+        stats_layout = QVBoxLayout(stats_group)
+        
+        self.stats_label = QLabel("點擊下方按鈕更新統計資訊")
+        self.stats_label.setAlignment(Qt.AlignCenter)
+        self.stats_label.setStyleSheet(f"font-size: 14px; color: {COLORS['text_dim']};")
+        
+        refresh_stats_btn = StyledButton("更新資料庫統計")
+        refresh_stats_btn.clicked.connect(self.refresh_database_stats)
+        
+        # 股票覆蓋率表格
+        stats_layout.addWidget(self.stats_label)
+        stats_layout.addWidget(refresh_stats_btn)
+        
+        # 上市/櫃股票覆蓋率
+        coverage_group = QGroupBox("股票資料覆蓋率")
+        coverage_layout = QVBoxLayout(coverage_group)
+        
+        self.coverage_table = QTableWidget()
+        self.coverage_table.setColumnCount(3)
+        self.coverage_table.setHorizontalHeaderLabels(["市場", "股票總數", "已有數據數量"])
+        self.coverage_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.coverage_table.setRowCount(3)
+        self.coverage_table.setItem(0, 0, QTableWidgetItem("上市"))
+        self.coverage_table.setItem(1, 0, QTableWidgetItem("櫃檯"))
+        self.coverage_table.setItem(2, 0, QTableWidgetItem("總計"))
+        
+        coverage_layout.addWidget(self.coverage_table)
+        
+        # 最近更新的股票
+        recent_group = QGroupBox("最近更新的股票")
+        recent_layout = QVBoxLayout(recent_group)
+        
+        self.recent_table = QTableWidget()
+        self.recent_table.setColumnCount(4)
+        self.recent_table.setHorizontalHeaderLabels(["股票代碼", "股票名稱", "最新數據日期", "數據筆數"])
+        self.recent_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        
+        recent_layout.addWidget(self.recent_table)
+        
+        # 添加各元素到主佈局
+        layout.addWidget(stats_group)
+        layout.addWidget(coverage_group)
+        layout.addWidget(recent_group)
+        
+        return tab
+    
+    def create_settings_tab(self):
+        """創建系統設定標籤頁"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # 資料庫連接設定
+        db_group = QGroupBox("資料庫連接設定")
+        db_layout = QFormLayout(db_group)
+        
+        # 主機
+        self.db_host_input = QLineEdit(self.db_config["host"])
+        db_layout.addRow("主機:", self.db_host_input)
+        
+        # 端口
+        self.db_port_input = QLineEdit(self.db_config["port"])
+        db_layout.addRow("端口:", self.db_port_input)
+        
+        # 資料庫名稱
+        self.db_name_input = QLineEdit(self.db_config["dbname"])
+        db_layout.addRow("資料庫名稱:", self.db_name_input)
+        
+        # 用戶名
+        self.db_user_input = QLineEdit(self.db_config["user"])
+        db_layout.addRow("用戶名:", self.db_user_input)
+        
+        # 密碼
+        self.db_password_input = QLineEdit(self.db_config["password"])
+        self.db_password_input.setEchoMode(QLineEdit.Password)
+        db_layout.addRow("密碼:", self.db_password_input)
+        
+        # 測試和保存按鈕
+        db_buttons = QHBoxLayout()
+        test_conn_btn = StyledButton("測試連接")
+        test_conn_btn.clicked.connect(self.test_database_connection)
+        
+        save_settings_btn = StyledButton("保存設定", accent=True)
+        save_settings_btn.clicked.connect(self.save_database_settings)
+        
+        db_buttons.addWidget(test_conn_btn)
+        db_buttons.addWidget(save_settings_btn)
+        db_buttons.addStretch()
+        
+        # 系統設定
+        system_group = QGroupBox("系統設定")
+        system_layout = QFormLayout(system_group)
+        
+        # 預設起始日期
+        self.default_start_year = QSpinBox()
+        self.default_start_year.setRange(1990, QDate.currentDate().year())
+        self.default_start_year.setValue(2010)
+        system_layout.addRow("預設數據起始年份:", self.default_start_year)
+        
+        # 最大同時下載數
+        self.max_concurrent = QSpinBox()
+        self.max_concurrent.setRange(1, 10)
+        self.max_concurrent.setValue(1)
+        self.max_concurrent.setEnabled(False)  # 暫時禁用，未實現並行下載
+        system_layout.addRow("最大同時下載數(未實現):", self.max_concurrent)
+        
+        # 系統設定按鈕
+        system_buttons = QHBoxLayout()
+        reset_settings_btn = StyledButton("重設為預設值")
+        reset_settings_btn.clicked.connect(self.reset_system_settings)
+        
+        save_system_btn = StyledButton("保存系統設定", accent=True)
+        save_system_btn.clicked.connect(self.save_system_settings)
+        
+        system_buttons.addWidget(reset_settings_btn)
+        system_buttons.addWidget(save_system_btn)
+        system_buttons.addStretch()
+        
+        # 關於區域
+        about_group = QGroupBox("關於")
+        about_layout = QVBoxLayout(about_group)
+        
+        about_text = QLabel("""
+        <p style='font-size: 14px;'>台灣股票數據更新系統 v1.0</p>
+        <p>此系統用於從Yahoo Finance下載台灣股票價格數據，並計算各種時間尺度的報酬率。</p>
+        <p>© 2023-2025 All rights reserved.</p>
+        """)
+        about_text.setTextFormat(Qt.RichText)
+        about_text.setWordWrap(True)
+        about_layout.addWidget(about_text)
+        
+        # 添加各區域到主佈局
+        layout.addWidget(db_group)
+        layout.addLayout(db_buttons)
+        layout.addWidget(system_group)
+        layout.addLayout(system_buttons)
+        layout.addWidget(about_group)
+        layout.addStretch()
+        
+        return tab
+    
+    def toggle_range_inputs(self):
+        """切換股票範圍輸入框的啟用狀態"""
+        enable = self.range_stocks_radio.isChecked()
+        self.range_from_input.setEnabled(enable)
+        self.range_to_input.setEnabled(enable)
+    
+    def execute_update(self):
+        """執行數據更新任務"""
+        # 檢查輸入
+        if not self.update_prices_check.isChecked() and not self.update_returns_check.isChecked():
+            QMessageBox.warning(self, "選項錯誤", "請至少選擇一種要更新的數據（股價或報酬率）")
+            return
+        
+        # 獲取更新模式
+        update_mode = 'full' if self.mode_full.isChecked() else 'incremental'
+        
+        # 確認警告，特別是全量更新模式
+        if update_mode == 'full':
+            reply = QMessageBox.question(
+                self, "確認全量更新", 
+                "全量更新將會移除並重新下載所有數據，這可能需要很長時間。\n\n是否確定要執行全量更新？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+        
+        # 獲取股票範圍
+        symbol_range = None
+        if self.range_stocks_radio.isChecked():
+            from_code = self.range_from_input.text().strip()
+            to_code = self.range_to_input.text().strip()
+            
+            if not from_code or not to_code:
+                QMessageBox.warning(self, "輸入錯誤", "請輸入完整的股票代碼範圍")
+                return
+            
+            symbol_range = (from_code, to_code)
+        
+        # 初始化進度顯示
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("準備中...")
+        
+        # 禁用更新按鈕，啟用取消按鈕
+        self.update_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        
+        # 啟動股票數據更新工作線程
+        self.stock_updater = StockDataUpdater(
+            self.db_config, 
+            update_mode=update_mode,
+            update_prices=self.update_prices_check.isChecked(),
+            update_returns=self.update_returns_check.isChecked(),
+            symbol_range=symbol_range
+        )
+        
+        # 連接信號
+        self.stock_updater.progress_update.connect(self.update_progress)
+        self.stock_updater.error_occurred.connect(self.handle_error)
+        self.stock_updater.result_ready.connect(self.handle_result)
+        
+        # 啟動工作線程
+        self.stock_updater.start()
+        
+        # 記錄開始信息
+        update_types = []
+        if self.update_prices_check.isChecked():
+            update_types.append("股價")
+        if self.update_returns_check.isChecked():
+            update_types.append("報酬率")
+            
+        log_msg = f"開始{update_mode}模式更新 {'+'.join(update_types)}數據"
+        if symbol_range:
+            log_msg += f"，股票範圍: {symbol_range[0]} 至 {symbol_range[1]}"
+        
+        self.add_log_message(log_msg)
+    
+    def cancel_update(self):
+        """取消數據更新任務"""
+        if hasattr(self, 'stock_updater') and self.stock_updater.isRunning():
+            reply = QMessageBox.question(
+                self, "確認取消", 
+                "確定要取消正在進行的數據更新任務嗎？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.stock_updater.stop()  # 設置停止標志
+                self.add_log_message("已發送取消信號，等待當前操作完成...")
+                self.cancel_btn.setEnabled(False)  # 防止多次點擊
+                self.progress_label.setText("正在取消...")
+    
+    def update_progress(self, progress, message):
+        """更新進度顯示"""
+        self.progress_bar.setValue(progress)
+        self.progress_label.setText(message)
+        self.add_log_message(message)
+    
+    def handle_error(self, error_message):
+        """處理錯誤信息"""
+        self.add_log_message(error_message, is_error=True)
+        self.progress_label.setText("執行失敗")
+        self.progress_label.setStyleSheet(f"color: {COLORS['error']};")
+        
+        # 重新啟用更新按鈕，禁用取消按鈕
+        self.update_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        
+        QMessageBox.critical(self, "更新錯誤", error_message)
+    
+    def handle_result(self, result_data):
+        """處理更新結果"""
+        # 更新結果表格
+        symbols = result_data.get('symbols', [])
+        self.result_table.setRowCount(len(symbols))
+        
+        for row, symbol_data in enumerate(symbols):
+            # 設置股票代碼欄位
+            symbol_item = QTableWidgetItem(symbol_data.get('symbol', ''))
+            self.result_table.setItem(row, 0, symbol_item)
+            
+            # 設置股票名稱欄位
+            name_item = QTableWidgetItem(symbol_data.get('name', ''))
+            self.result_table.setItem(row, 1, name_item)
+        
+        # 計算並顯示總結信息
+        elapsed_time = result_data.get('elapsed_time', 0)
+        update_mode = result_data.get('update_mode', '')
+        prices_updated = result_data.get('prices_updated', False)
+        returns_updated = result_data.get('returns_updated', False)
+        
+        updates = []
+        if prices_updated:
+            updates.append("股價")
+        if returns_updated:
+            updates.append("報酬率")
+        
+        result_message = f"數據更新完成! 模式: {update_mode}, 更新內容: {'+'.join(updates)}, 總時間: {elapsed_time:.2f} 秒"
+        
+        self.add_log_message(result_message)
+        self.progress_label.setText("更新完成")
+        self.progress_label.setStyleSheet(f"color: {COLORS['success']};")
+        
+        # 重新啟用更新按鈕，禁用取消按鈕
+        self.update_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        
+        # 顯示確認對話框
+        QMessageBox.information(self, "更新完成", result_message)
+
+    def query_price_data(self):
+            """查詢股價數據"""
+            ticker = self.ticker_input.text().strip()
+            if not ticker:
+                QMessageBox.warning(self, "輸入錯誤", "請輸入股票代碼")
+                return
+            
+            start_date = self.start_date.date().toString("yyyy-MM-dd")
+            end_date = self.end_date.date().toString("yyyy-MM-dd")
+            
+            try:
+                # 構建數據庫連接字符串
+                db_uri = f"postgresql://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
+                engine = create_engine(db_uri)
+                
+                # 執行查詢
+                query = f"""
+                SELECT ticker, "Date", "Open", "High", "Low", "Close", "Volume"
+                FROM taiwan_stock_prices
+                WHERE ticker = '{ticker}'
+                AND "Date" BETWEEN '{start_date}' AND '{end_date}'
+                ORDER BY "Date"
+                """
+                
+                result = pd.read_sql(query, engine)
+                
+                if result.empty:
+                    self.add_log_message(f"查詢結果為空: {ticker} 從 {start_date} 到 {end_date}")
+                    QMessageBox.information(self, "查詢結果", "沒有找到符合條件的數據")
+                    return
+                
+                # 更新查詢結果表格
+                self.update_query_table(result)
+                
+                self.add_log_message(f"查詢股價數據成功: {ticker} 從 {start_date} 到 {end_date}，共 {len(result)} 筆")
+                
+            except Exception as e:
+                error_msg = f"查詢股價數據時發生錯誤: {str(e)}"
+                self.add_log_message(error_msg, is_error=True)
+                QMessageBox.critical(self, "查詢錯誤", error_msg)
+    
+    def query_return_data(self):
+        """查詢報酬率數據"""
+        ticker = self.ticker_input.text().strip()
+        if not ticker:
+            QMessageBox.warning(self, "輸入錯誤", "請輸入股票代碼")
+            return
+        
+        start_date = self.start_date.date().toString("yyyy-MM-dd")
+        end_date = self.end_date.date().toString("yyyy-MM-dd")
+        
+        # 獲取報酬率時間尺度
+        frequency_map = {
+            "日報酬率": "daily",
+            "週報酬率": "weekly",
+            "月報酬率": "monthly",
+            "季報酬率": "quarterly",
+            "年報酬率": "yearly"
+        }
+        frequency = frequency_map[self.frequency_combo.currentText()]
+        
+        try:
+            # 構建數據庫連接字符串
+            db_uri = f"postgresql://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
+            engine = create_engine(db_uri)
+            
+            # 執行查詢
+            query = f"""
+            SELECT ticker, "Date", frequency, "return"
+            FROM taiwan_stock_returns
+            WHERE ticker = '{ticker}'
+            AND frequency = '{frequency}'
+            AND "Date" BETWEEN '{start_date}' AND '{end_date}'
+            ORDER BY "Date"
+            """
+            
+            result = pd.read_sql(query, engine)
+            
+            if result.empty:
+                self.add_log_message(f"查詢結果為空: {ticker} {frequency} 從 {start_date} 到 {end_date}")
+                QMessageBox.information(self, "查詢結果", "沒有找到符合條件的數據")
+                return
+            
+            # 將報酬率轉換為百分比
+            result['return'] = result['return'] * 100
+            
+            # 更新查詢結果表格
+            self.update_query_table(result)
+            
+            self.add_log_message(f"查詢報酬率數據成功: {ticker} {frequency} 從 {start_date} 到 {end_date}，共 {len(result)} 筆")
+            
+        except Exception as e:
+            error_msg = f"查詢報酬率數據時發生錯誤: {str(e)}"
+            self.add_log_message(error_msg, is_error=True)
+            QMessageBox.critical(self, "查詢錯誤", error_msg)
+    
+    def update_query_table(self, df):
+        """更新查詢結果表格"""
+        # 清空表格
+        self.query_table.clear()
+        
+        # 設置列數和標題
+        self.query_table.setColumnCount(len(df.columns))
+        self.query_table.setHorizontalHeaderLabels(df.columns)
+        
+        # 設置行數
+        self.query_table.setRowCount(len(df))
+        
+        # 填充數據
+        for i, row in df.iterrows():
+            for j, value in enumerate(row):
+                # 將日期格式化為字符串
+                if j == 1 and isinstance(value, pd.Timestamp):  # 假設第二列是日期列
+                    value = value.strftime('%Y-%m-%d')
+                # 將數值四捨五入到小數點後 4 位
+                elif isinstance(value, (float, np.float64)):
+                    value = round(value, 4)
+                
+                item = QTableWidgetItem(str(value))
+                self.query_table.setItem(i, j, item)
+        
+        # 調整列寬以適應內容
+        self.query_table.resizeColumnsToContents()
+    
+    def export_query_results(self):
+        """導出查詢結果"""
+        # 檢查是否有數據可導出
+        if self.query_table.rowCount() == 0:
+            QMessageBox.warning(self, "導出錯誤", "沒有查詢結果可供導出")
+            return
+        
+        # 打開檔案保存對話框
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "導出查詢結果", "", "CSV 檔案 (*.csv);;Excel 檔案 (*.xlsx)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # 構建 DataFrame
+            columns = [self.query_table.horizontalHeaderItem(i).text() 
+                      for i in range(self.query_table.columnCount())]
+            
+            data = []
+            for row in range(self.query_table.rowCount()):
+                row_data = []
+                for col in range(self.query_table.columnCount()):
+                    item = self.query_table.item(row, col)
+                    row_data.append(item.text() if item else "")
+                data.append(row_data)
+            
+            df = pd.DataFrame(data, columns=columns)
+            
+            # 保存文件
+            if file_path.endswith('.csv'):
+                df.to_csv(file_path, index=False)
+            elif file_path.endswith('.xlsx'):
+                df.to_excel(file_path, index=False)
+            else:
+                # 如果沒有指定有效的副檔名，添加預設的 .csv
+                file_path += '.csv' if not '.' in file_path else ''
+                df.to_csv(file_path, index=False)
+            
+            self.add_log_message(f"查詢結果已導出到: {file_path}")
+            QMessageBox.information(self, "導出成功", f"查詢結果已成功導出到:\n{file_path}")
+            
+        except Exception as e:
+            error_msg = f"導出查詢結果時發生錯誤: {str(e)}"
+            self.add_log_message(error_msg, is_error=True)
+            QMessageBox.critical(self, "導出錯誤", error_msg)
+    
+    def refresh_database_stats(self):
+        """更新資料庫統計信息"""
+        try:
+            # 構建數據庫連接字符串
+            db_uri = f"postgresql://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
+            engine = create_engine(db_uri)
+            
+            # 獲取數據庫統計
+            self.stats_label.setText("正在統計資料庫狀態...")
+            
+            # 使用 text() 包裝 SQL 查詢
+            with engine.connect() as conn:
+                # 1. 獲取表的行數
+                prices_count_query = text("SELECT COUNT(*) FROM taiwan_stock_prices")
+                returns_count_query = text("SELECT COUNT(*) FROM taiwan_stock_returns")
+                
+                prices_count_result = conn.execute(prices_count_query)
+                prices_count = prices_count_result.scalar()
+                
+                returns_count_result = conn.execute(returns_count_query)
+                returns_count = returns_count_result.scalar()
+                
+                # 2. 獲取不同股票數量
+                prices_ticker_query = text("SELECT COUNT(DISTINCT ticker) FROM taiwan_stock_prices")
+                returns_ticker_query = text("SELECT COUNT(DISTINCT ticker) FROM taiwan_stock_returns")
+                
+                prices_ticker_result = conn.execute(prices_ticker_query)
+                prices_ticker_count = prices_ticker_result.scalar()
+                
+                returns_ticker_result = conn.execute(returns_ticker_query)
+                returns_ticker_count = returns_ticker_result.scalar()
+                
+                # 3. 獲取最新/最早日期
+                latest_date_query = text("SELECT MAX(\"Date\") FROM taiwan_stock_prices")
+                earliest_date_query = text("SELECT MIN(\"Date\") FROM taiwan_stock_prices")
+                
+                latest_date_result = conn.execute(latest_date_query)
+                latest_date = latest_date_result.scalar()
+                
+                earliest_date_result = conn.execute(earliest_date_query)
+                earliest_date = earliest_date_result.scalar()
+                
+                if latest_date:
+                    latest_date = pd.to_datetime(latest_date).strftime('%Y-%m-%d')
+                if earliest_date:
+                    earliest_date = pd.to_datetime(earliest_date).strftime('%Y-%m-%d')
+                
+                # 4. 上市/櫃股票分類計數
+                twse_query = text("SELECT COUNT(DISTINCT ticker) FROM taiwan_stock_prices WHERE ticker LIKE '%.TW'")
+                otc_query = text("SELECT COUNT(DISTINCT ticker) FROM taiwan_stock_prices WHERE ticker LIKE '%.TWO'")
+                
+                twse_result = conn.execute(twse_query)
+                twse_count = twse_result.scalar()
+                
+                otc_result = conn.execute(otc_query)
+                otc_count = otc_result.scalar()
+                
+                # 5. 獲取最近更新的股票
+                recent_query = text("""
+                SELECT p.ticker, MAX(p."Date") as latest_date, COUNT(*) as record_count
+                FROM taiwan_stock_prices p
+                GROUP BY p.ticker
+                ORDER BY latest_date DESC, ticker
+                LIMIT 10
+                """)
+                
+                recent_result = conn.execute(recent_query)
+                recent_data = recent_result.fetchall()
+                
+                # 轉換結果為 DataFrame
+                recent_df = pd.DataFrame(recent_data, columns=["ticker", "latest_date", "record_count"])
+            
+            # 更新統計信息標籤
+            stats_text = f"""
+            <b>資料庫狀態摘要</b>
+            <p>股價數據: {prices_count:,} 筆 ({prices_ticker_count} 檔股票)</p>
+            <p>報酬率數據: {returns_count:,} 筆 ({returns_ticker_count} 檔股票)</p>
+            <p>數據日期範圍: {earliest_date} 至 {latest_date}</p>
+            """
+            
+            self.stats_label.setText(stats_text)
+            self.stats_label.setTextFormat(Qt.RichText)
+            
+            # 更新覆蓋率表格
+            self.coverage_table.setItem(0, 1, QTableWidgetItem(str(self.get_twse_symbol_count())))
+            self.coverage_table.setItem(0, 2, QTableWidgetItem(str(twse_count)))
+            
+            self.coverage_table.setItem(1, 1, QTableWidgetItem(str(self.get_otc_symbol_count())))
+            self.coverage_table.setItem(1, 2, QTableWidgetItem(str(otc_count)))
+            
+            total_symbols = self.get_twse_symbol_count() + self.get_otc_symbol_count()
+            self.coverage_table.setItem(2, 1, QTableWidgetItem(str(total_symbols)))
+            self.coverage_table.setItem(2, 2, QTableWidgetItem(str(twse_count + otc_count)))
+            
+            # 更新最近更新股票表格
+            self.recent_table.setRowCount(len(recent_df))
+            
+            for i, (_, row) in enumerate(recent_df.iterrows()):
+                ticker = row['ticker']
+                latest_date = pd.to_datetime(row['latest_date']).strftime('%Y-%m-%d')
+                record_count = row['record_count']
+                
+                ticker_item = QTableWidgetItem(ticker)
+                # 嘗試獲取股票名稱
+                try:
+                    with engine.connect() as conn:
+                        name_query = text(f"SELECT name FROM stock_names WHERE ticker = :ticker LIMIT 1")
+                        name_result = conn.execute(name_query, {"ticker": ticker})
+                        name_row = name_result.fetchone()
+                        name = name_row[0] if name_row else "未知"
+                except:
+                    name = "未知"
+                
+                name_item = QTableWidgetItem(name)
+                date_item = QTableWidgetItem(latest_date)
+                count_item = QTableWidgetItem(str(record_count))
+                
+                self.recent_table.setItem(i, 0, ticker_item)
+                self.recent_table.setItem(i, 1, name_item)
+                self.recent_table.setItem(i, 2, date_item)
+                self.recent_table.setItem(i, 3, count_item)
+            
+            self.add_log_message("資料庫統計信息已更新")
+        
+        except Exception as e:
+            error_msg = f"更新資料庫統計時發生錯誤: {str(e)}\n{traceback.format_exc()}"
+            self.add_log_message(error_msg, is_error=True)
+            self.stats_label.setText(f"獲取統計資訊失敗: {str(e)}")
+            QMessageBox.critical(self, "統計錯誤", error_msg)
+    
+    def get_twse_symbol_count(self):
+        """獲取台灣上市公司數量"""
+        try:
+            symbols = StockDataUpdater.fetch_twse_symbols(self)
+            return len(symbols)
+        except:
+            return 0
+    
+    def get_otc_symbol_count(self):
+        """獲取台灣櫃檯公司數量"""
+        try:
+            symbols = StockDataUpdater.fetch_otc_symbols(self)
+            return len(symbols)
+        except:
+            return 0
+    
+    def test_database_connection(self):
+        """測試資料庫連接"""
+        # 獲取當前數據庫設定
+        host = self.db_host_input.text()
+        port = self.db_port_input.text()
+        dbname = self.db_name_input.text()
+        user = self.db_user_input.text()
+        password = self.db_password_input.text()
+        
+        # 構建臨時數據庫配置
+        db_config = {
+            "host": host,
+            "port": port,
+            "dbname": dbname,
+            "user": user,
+            "password": password
+        }
+        
+        # 構建數據庫連接字符串
+        db_uri = f"postgresql://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['dbname']}"
+        
+        try:
+            # 嘗試連接
+            engine = create_engine(db_uri)
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+                
+            self.add_log_message("數據庫連接測試成功!")
+            QMessageBox.information(self, "連接成功", "成功連接到數據庫!")
+            return True
+            
+        except Exception as e:
+            error_msg = f"數據庫連接測試失敗: {str(e)}"
+            self.add_log_message(error_msg, is_error=True)
+            QMessageBox.critical(self, "連接失敗", error_msg)
+            return False
+    
+    def save_database_settings(self):
+        """保存資料庫設定"""
+        # 獲取當前數據庫設定
+        host = self.db_host_input.text()
+        port = self.db_port_input.text()
+        dbname = self.db_name_input.text()
+        user = self.db_user_input.text()
+        password = self.db_password_input.text()
+        
+        # 檢查必填欄位
+        if not host or not port or not dbname or not user:
+            QMessageBox.warning(self, "輸入錯誤", "請填寫所有必要的資料庫設定")
+            return
+        
+        # 更新全局數據庫配置
+        self.db_config = {
+            "host": host,
+            "port": port,
+            "dbname": dbname,
+            "user": user,
+            "password": password
+        }
+        
+        # 測試新連接
+        if self.check_database_connection():
+            self.add_log_message("資料庫設定已儲存並已成功連接")
+            QMessageBox.information(self, "設定已儲存", "資料庫設定已儲存並已成功連接")
+        else:
+            QMessageBox.warning(self, "連接警告", "設定已儲存，但連接測試失敗")
+    
+    def reset_system_settings(self):
+        """重設系統設定為預設值"""
+        self.default_start_year.setValue(2010)
+        self.max_concurrent.setValue(1)
+        
+        self.add_log_message("系統設定已重設為預設值")
+        QMessageBox.information(self, "設定已重設", "系統設定已重設為預設值")
+    
+    def save_system_settings(self):
+        """保存系統設定"""
+        # 目前只有兩個設定，這裡簡單處理
+        # 在真實系統中，可能需要將這些設定保存到配置文件或資料庫
+        
+        self.add_log_message("系統設定已儲存")
+        QMessageBox.information(self, "設定已儲存", "系統設定已儲存")
+    
+    def check_database_connection(self, silent=False): # <--- 方法定義，縮排一層
+        """檢查資料庫連接狀態"""
+        # <--- 方法內部程式碼，縮排兩層 (相對於檔案開頭)
+
+        # 檢查 self.db_config 是否存在且包含 host
+        if not self.db_config or not self.db_config.get("host"):
+             # <--- if 區塊內部，縮排三層
+             if hasattr(self, 'db_status_label'):
+                 self.db_status_label.setText("資料庫狀態: 未配置")
+                 self.db_status_label.setStyleSheet(f"color: {COLORS['warning']}; padding: 5px; border: 1px solid {COLORS['bg_light']}; border-radius: 3px;")
+             if not silent:
+                 self.add_log_message("資料庫連接未配置。", is_error=True)
+             return False # <--- 結束 if 區塊
+
+        # !!!!! 確保以下程式碼與上面的 'if' 語句在同一縮排層級 !!!!!
+        # <--- 回到方法內部的主要層級，縮排兩層
+        db_uri = f"postgresql://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
+        status_ok = False
+        error_str = ""
+
+        # <--- try 語句，縮排兩層
+        try:
+            # <--- try 區塊內部，縮排三層
+            engine = create_engine(db_uri, connect_args={'connect_timeout': 3}) # Shorter timeout for status check
+            with engine.connect() as conn:
+                # <--- with 區塊內部，縮排四層
+                conn.execute(text("SELECT 1"))
+            # <--- 回到 try 區塊內部，縮排三層
+            status_ok = True
+        # <--- except 語句，與 try 對齊，縮排兩層
+        except Exception as e:
+            # <--- except 區塊內部，縮排三層
+            error_str = str(e)
+            status_ok = False
+
+        # <--- 更新 UI 的 if 語句，縮排兩層
+        if hasattr(self, 'db_status_label'):
+            # <--- if 區塊內部，縮排三層
+            if status_ok:
+                self.db_status_label.setText("資料庫狀態: 已連接")
+                self.db_status_label.setStyleSheet(f"color: {COLORS['success']}; padding: 5px; border: 1px solid {COLORS['bg_light']}; border-radius: 3px;")
+            else:
+                self.db_status_label.setText(f"資料庫狀態: 連接失敗")
+                self.db_status_label.setStyleSheet(f"color: {COLORS['error']}; padding: 5px; border: 1px solid {COLORS['bg_light']}; border-radius: 3px;")
+                self.db_status_label.setToolTip(f"錯誤: {error_str}") # Show error on hover
+
+        # <--- 記錄日誌的 if 語句，縮排兩層
+        if not silent:
+            # <--- if 區塊內部，縮排三層
+            if status_ok:
+                self.add_log_message("數據庫連接成功")
+            else:
+                 self.add_log_message(f"數據庫連接失敗: {error_str}", is_error=True)
+
+        # <--- final return 語句，縮排兩層
+        return status_ok
+    
+    def add_log_message(self, message, is_error=False):
+        """添加日誌消息"""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        if is_error:
+            formatted_message = f"<span style='color:{COLORS['error']};'>[{timestamp}] ERROR: {message}</span>"
+            logger.error(message)
+        else:
+            formatted_message = f"<span style='color:{COLORS['text_light']};'>[{timestamp}] INFO: {message}</span>"
+            logger.info(message)
+        
+        # 添加到日誌視窗
+        self.log_text.append(formatted_message)
+        
+        # 滾動到最底部
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def clear_log(self):
+        """清除日誌內容"""
+        self.log_text.clear()
+        self.add_log_message("日誌已清除")
+    
+    def export_log(self):
+        """導出日誌內容"""
+        # 打開檔案保存對話框
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "導出日誌", "", "文字檔案 (*.txt);;HTML 檔案 (*.html)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            if file_path.endswith('.html'):
+                # 導出為 HTML 格式
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('<html><head>')
+                    f.write('<meta charset="utf-8">')
+                    f.write('<title>台灣股票數據更新系統 - 日誌</title>')
+                    f.write('</head><body style="background-color: #1E1E2E; color: #CDD6F4; font-family: monospace;">')
+                    f.write(self.log_text.toHtml())
+                    f.write('</body></html>')
+            else:
+                # 導出為純文字格式
+                # 移除 HTML 標籤
+                text = self.log_text.toPlainText()
+                
+                # 如果沒有指定副檔名，添加 .txt
+                if not file_path.endswith('.txt') and not '.' in file_path:
+                    file_path += '.txt'
+                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+            
+            self.add_log_message(f"日誌已導出到: {file_path}")
+            
+        except Exception as e:
+            error_msg = f"導出日誌時發生錯誤: {str(e)}"
+            self.add_log_message(error_msg, is_error=True)
+            QMessageBox.critical(self, "導出錯誤", error_msg)
+
+
+def main():
+    """主函數"""
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
