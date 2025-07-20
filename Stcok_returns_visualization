@@ -1,0 +1,704 @@
+import sys
+import time
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine, text
+import logging
+from typing import Dict, List, Optional
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, 
+                            QMessageBox, QGroupBox, QTabWidget, QComboBox, QSpinBox, 
+                            QDateEdit, QLineEdit, QCheckBox, QFileDialog, QSplitter)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDate, QTimer
+from PyQt5.QtGui import QFont, QColor, QBrush
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import seaborn as sns
+
+# 配置日誌
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# 顏色方案 - 深色藍色主題
+COLORS = {
+    'bg_dark': "#1E1E2E",
+    'bg_medium': "#313244",
+    'bg_light': "#45475A",
+    'text_light': "#CDD6F4",
+    'text_dim': "#BAC2DE",
+    'accent': "#89B4FA",
+    'accent_alt': "#74C7EC",
+    'success': "#A6E3A1",
+    'error': "#F38BA8",
+    'warning': "#FAB387",
+    'neutral': "#94E2D5",
+    'gain': "#A6E3A1",  # 綠色表示上漲
+    'loss': "#F38BA8",  # 紅色表示下跌
+}
+
+
+class ReturnRankingWorker(QThread):
+    """計算報酬率排行的工作線程"""
+    progress_update = pyqtSignal(str)
+    result_ready = pyqtSignal(pd.DataFrame)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, db_config: Dict, frequency: str, date_range: tuple, 
+                 top_n: int = 50, include_negative: bool = True):
+        super().__init__()
+        self.db_config = db_config
+        self.frequency = frequency
+        self.start_date, self.end_date = date_range
+        self.top_n = top_n
+        self.include_negative = include_negative
+        
+    def run(self):
+        """執行報酬率排行計算"""
+        try:
+            self.progress_update.emit("正在連接資料庫...")
+            
+            # 構建資料庫連接
+            db_uri = f"postgresql://{self.db_config['user']}:{self.db_config['password']}@{self.db_config['host']}:{self.db_config['port']}/{self.db_config['dbname']}"
+            engine = create_engine(db_uri)
+            
+            self.progress_update.emit(f"正在查詢{self.frequency}報酬率數據...")
+            
+            # 查詢指定期間的報酬率數據
+            query = f"""
+            WITH latest_returns AS (
+                SELECT 
+                    ticker,
+                    "Date",
+                    "return",
+                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY "Date" DESC) as rn
+                FROM taiwan_stock_returns
+                WHERE frequency = '{self.frequency}'
+                AND "Date" BETWEEN '{self.start_date}' AND '{self.end_date}'
+            ),
+            avg_returns AS (
+                SELECT 
+                    ticker,
+                    AVG("return") as avg_return,
+                    COUNT(*) as data_points,
+                    MIN("Date") as first_date,
+                    MAX("Date") as last_date
+                FROM taiwan_stock_returns
+                WHERE frequency = '{self.frequency}'
+                AND "Date" BETWEEN '{self.start_date}' AND '{self.end_date}'
+                GROUP BY ticker
+            )
+            SELECT 
+                lr.ticker,
+                lr."return" as latest_return,
+                lr."Date" as latest_date,
+                ar.avg_return,
+                ar.data_points,
+                ar.first_date,
+                ar.last_date
+            FROM latest_returns lr
+            JOIN avg_returns ar ON lr.ticker = ar.ticker
+            WHERE lr.rn = 1
+            ORDER BY lr."return" DESC
+            """
+            
+            df = pd.read_sql(query, engine)
+            
+            if df.empty:
+                self.error_occurred.emit("查無符合條件的報酬率數據")
+                return
+            
+            self.progress_update.emit("正在查詢股票名稱...")
+            
+            # 嘗試從股價表中獲取股票名稱（如果有股票名稱表更好）
+            ticker_list = df['ticker'].unique().tolist()
+            ticker_names = {}
+            
+            # 批次查詢股票名稱以提高效率
+            for i in range(0, len(ticker_list), 100):
+                batch = ticker_list[i:i+100]
+                ticker_str = "','".join(batch)
+                
+                # 這裡假設您可能有一個股票名稱對照表
+                # 如果沒有，我們就用股票代碼本身
+                try:
+                    name_query = f"""
+                    SELECT DISTINCT ticker, ticker as name
+                    FROM taiwan_stock_prices
+                    WHERE ticker IN ('{ticker_str}')
+                    """
+                    name_df = pd.read_sql(name_query, engine)
+                    for _, row in name_df.iterrows():
+                        ticker_names[row['ticker']] = row['name']
+                except:
+                    pass
+            
+            # 添加股票名稱到 DataFrame
+            df['name'] = df['ticker'].map(ticker_names).fillna('未知')
+            
+            # 計算報酬率百分比
+            df['latest_return_pct'] = df['latest_return'] * 100
+            df['avg_return_pct'] = df['avg_return'] * 100
+            
+            # 根據設定過濾結果
+            if not self.include_negative:
+                df = df[df['latest_return'] > 0]
+            
+            # 取前 N 名和後 N 名
+            if len(df) > self.top_n * 2:
+                top_df = df.head(self.top_n)
+                bottom_df = df.tail(self.top_n)
+                df = pd.concat([top_df, bottom_df])
+            
+            self.progress_update.emit("報酬率排行計算完成")
+            self.result_ready.emit(df)
+            
+        except Exception as e:
+            error_msg = f"計算報酬率排行時發生錯誤: {str(e)}"
+            logger.error(error_msg)
+            self.error_occurred.emit(error_msg)
+
+
+class StyledButton(QPushButton):
+    """具有科技感的按鈕"""
+    def __init__(self, text, parent=None, accent=False):
+        super().__init__(text, parent)
+        self.setMinimumHeight(36)
+        self.setCursor(Qt.PointingHandCursor)
+        
+        if accent:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['accent']};
+                    color: {COLORS['bg_dark']};
+                    font-weight: bold;
+                    border: none;
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{
+                    background-color: {COLORS['accent_alt']};
+                }}
+                QPushButton:pressed {{
+                    background-color: {COLORS['accent']};
+                    padding: 10px 16px 6px 16px;
+                }}
+            """)
+        else:
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {COLORS['bg_medium']};
+                    color: {COLORS['text_light']};
+                    border: 1px solid {COLORS['bg_light']};
+                    border-radius: 5px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{
+                    background-color: {COLORS['bg_light']};
+                    border: 1px solid {COLORS['accent']};
+                }}
+            """)
+
+
+class ReturnChart(FigureCanvas):
+    """報酬率圖表元件"""
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(10, 6), facecolor=COLORS['bg_medium'])
+        super().__init__(self.fig)
+        self.setParent(parent)
+        
+    def update_chart(self, df: pd.DataFrame, title: str):
+        """更新圖表"""
+        self.fig.clear()
+        ax = self.fig.add_subplot(111, facecolor=COLORS['bg_light'])
+        
+        if df.empty:
+            ax.text(0.5, 0.5, '無數據', ha='center', va='center', 
+                   transform=ax.transAxes, color=COLORS['text_dim'])
+            self.draw()
+            return
+        
+        # 準備數據
+        df_sorted = df.copy()
+        # 根據是否為Top或Bottom圖表決定排序方式
+        if "Top" in title:
+            df_sorted = df_sorted.sort_values('latest_return_pct', ascending=True)
+        else:
+            df_sorted = df_sorted.sort_values('latest_return_pct', ascending=False)
+        
+        # 設定顏色
+        colors = [COLORS['gain'] if x > 0 else COLORS['loss'] 
+                  for x in df_sorted['latest_return_pct']]
+        
+        # 繪製橫條圖
+        bars = ax.barh(range(len(df_sorted)), df_sorted['latest_return_pct'], 
+                       color=colors, alpha=0.8)
+        
+        # 設定標籤
+        ax.set_yticks(range(len(df_sorted)))
+        ax.set_yticklabels([f"{row['ticker']}" for _, row in df_sorted.iterrows()])
+        ax.set_xlabel('報酬率 (%)', color=COLORS['text_light'])
+        ax.set_title(title, color=COLORS['text_light'], fontsize=14, pad=20)
+        
+        # 設定樣式
+        ax.tick_params(colors=COLORS['text_dim'])
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color(COLORS['bg_light'])
+        ax.spines['left'].set_color(COLORS['bg_light'])
+        ax.grid(True, alpha=0.2, color=COLORS['bg_light'])
+        
+        # 添加數值標籤
+        for i, (bar, value) in enumerate(zip(bars, df_sorted['latest_return_pct'])):
+            ax.text(value + (0.1 if value > 0 else -0.1), i, 
+                   f'{value:.2f}%', va='center', 
+                   ha='left' if value > 0 else 'right',
+                   color=COLORS['text_dim'], fontsize=9)
+        
+        self.fig.tight_layout()
+        self.draw()
+
+
+class ReturnRankingWindow(QMainWindow):
+    """股票報酬率排行系統主視窗"""
+    def __init__(self):
+        super().__init__()
+        
+        # 資料庫配置
+        self.db_config = {
+            "host": "localhost",
+            "port": "5432",
+            "user": "postgres",
+            "password": "s8304021",
+            "dbname": "postgres"
+        }
+        
+        self.current_df = None
+        self.init_ui()
+        
+    def init_ui(self):
+        """初始化使用者界面"""
+        self.setWindowTitle("BlackCore 黑核引擎")
+        self.setGeometry(100, 100, 1400, 900)
+        
+        # 設置全局樣式
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_light']};
+            }}
+            QLabel {{
+                color: {COLORS['text_light']};
+            }}
+            QGroupBox {{
+                border: 1px solid {COLORS['bg_light']};
+                border-radius: 5px;
+                margin-top: 20px;
+                font-weight: bold;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }}
+            QTableWidget {{
+                background-color: {COLORS['bg_medium']};
+                alternate-background-color: {COLORS['bg_light']};
+                gridline-color: {COLORS['bg_light']};
+            }}
+            QTableWidget::item {{
+                padding: 4px;
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_light']};
+                padding: 5px;
+                border: none;
+            }}
+            QComboBox, QDateEdit, QSpinBox, QLineEdit {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_light']};
+                border: 1px solid {COLORS['bg_light']};
+                border-radius: 3px;
+                padding: 5px;
+            }}
+        """)
+        
+        # 主視窗佈局
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # 主標題
+        title = QLabel("BlackCore 黑核引擎")
+        title.setStyleSheet(f"""
+            font-size: 28px;
+            color: {COLORS['accent']};
+            font-weight: bold;
+            padding: 10px 10px 0px 10px;
+        """)
+        title.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title)
+        
+        # --- ➤【修改】具有科技感的副標題 ---
+      # 具有科技感的副標題
+        subtitle = QLabel()
+        subtitle.setTextFormat(Qt.RichText)
+
+        # 使用HTML組合新的中英文副標題
+        subtitle_text = f"""
+            <span style="font-family: 'Consolas', 'Courier New', monospace; color:{COLORS['accent_alt']};">[SPECTROMETER v1.0]</span>
+            <span style="font-weight: bold; color:{COLORS['text_light']};"> 報酬光譜儀 </span>
+            <span style="color:{COLORS['bg_light']};">|</span>
+            <i style="color:{COLORS['neutral']};"> Return Spectrum</i>
+            <span style="font-weight: bold; color:{COLORS['success']};"> [ONLINE]</span>
+        """
+        subtitle.setText(subtitle_text)
+
+        # 設定副標題的整體樣式（字體大小、邊框等）
+        subtitle.setStyleSheet(f"""
+            font-size: 17px;
+            padding-bottom: 8px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid {COLORS['bg_medium']};
+        """)
+        subtitle.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(subtitle)
+        # --- ➤ 副標題修改結束 ---
+        
+        # 控制面板
+        control_panel = self.create_control_panel()
+        main_layout.addWidget(control_panel)
+        
+        # 內容區域（分割器）
+        content_splitter = QSplitter(Qt.Horizontal)
+        
+        # 左側：排行表格
+        table_widget = self.create_table_widget()
+        
+        # 右側：圖表
+        chart_widget = self.create_chart_widget()
+        
+        content_splitter.addWidget(table_widget)
+        content_splitter.addWidget(chart_widget)
+        content_splitter.setSizes([800, 600])
+        
+        main_layout.addWidget(content_splitter)
+        
+        # 狀態列
+        self.status_label = QLabel("就緒")
+        self.status_label.setStyleSheet(f"padding: 5px; color: {COLORS['text_dim']};")
+        main_layout.addWidget(self.status_label)
+        
+        # 自動刷新計時器
+        self.auto_refresh_timer = QTimer()
+        self.auto_refresh_timer.timeout.connect(self.refresh_data)
+        
+    def create_control_panel(self):
+        """創建控制面板"""
+        group = QGroupBox("查詢條件")
+        layout = QHBoxLayout(group)
+        
+        # 報酬率頻率選擇
+        freq_label = QLabel("報酬率頻率:")
+        self.frequency_combo = QComboBox()
+        self.frequency_combo.addItems(['daily', 'weekly', 'monthly', 'quarterly', 'yearly'])
+        self.frequency_combo.setCurrentText('daily')
+        
+        # 日期範圍
+        date_label = QLabel("日期範圍:")
+        self.start_date = QDateEdit()
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDate(QDate.currentDate().addMonths(-1))
+        
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDate(QDate.currentDate())
+        
+        # 顯示筆數
+        top_n_label = QLabel("顯示筆數:")
+        self.top_n_spin = QSpinBox()
+        self.top_n_spin.setRange(10, 100)
+        self.top_n_spin.setValue(50)
+        self.top_n_spin.setSingleStep(10)
+        
+        # 選項
+        self.include_negative_check = QCheckBox("包含負報酬")
+        self.include_negative_check.setChecked(True)
+        
+        self.auto_refresh_check = QCheckBox("自動刷新(5分鐘)")
+        self.auto_refresh_check.toggled.connect(self.toggle_auto_refresh)
+        
+        # 按鈕
+        self.refresh_btn = StyledButton("查詢報酬率排行", accent=True)
+        self.refresh_btn.clicked.connect(self.refresh_data)
+        
+        self.export_btn = StyledButton("匯出數據")
+        self.export_btn.clicked.connect(self.export_data)
+        
+        # 添加到佈局
+        layout.addWidget(freq_label)
+        layout.addWidget(self.frequency_combo)
+        layout.addWidget(date_label)
+        layout.addWidget(self.start_date)
+        layout.addWidget(QLabel("至"))
+        layout.addWidget(self.end_date)
+        layout.addWidget(top_n_label)
+        layout.addWidget(self.top_n_spin)
+        layout.addWidget(self.include_negative_check)
+        layout.addWidget(self.auto_refresh_check)
+        layout.addStretch()
+        layout.addWidget(self.refresh_btn)
+        layout.addWidget(self.export_btn)
+        
+        return group
+        
+    def create_table_widget(self):
+        """創建排行表格"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # 搜尋框
+        search_layout = QHBoxLayout()
+        search_label = QLabel("搜尋股票:")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("輸入股票代碼或名稱...")
+        self.search_input.textChanged.connect(self.filter_table)
+        
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input)
+        layout.addLayout(search_layout)
+        
+        # 表格
+        self.ranking_table = QTableWidget()
+        self.ranking_table.setColumnCount(8)
+        self.ranking_table.setHorizontalHeaderLabels([
+            "排名", "股票代碼", "股票名稱", "最新報酬率(%)", 
+            "平均報酬率(%)", "數據點數", "最新日期", "期間"
+        ])
+        
+        # 設定欄位寬度
+        header = self.ranking_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.ranking_table.setColumnWidth(0, 60)
+        self.ranking_table.setColumnWidth(1, 100)
+        
+        self.ranking_table.setAlternatingRowColors(True)
+        self.ranking_table.setSortingEnabled(True)
+        
+        layout.addWidget(self.ranking_table)
+        
+        return widget
+        
+    def create_chart_widget(self):
+        self.chart_tabs = QTabWidget()
+        self.chart_tabs.setTabPosition(QTabWidget.North)
+        self.chart_tabs.setTabShape(QTabWidget.Rounded)
+
+        # 設定頁簽樣式
+        self.chart_tabs.setStyleSheet(f"""
+            QTabBar::tab {{
+                background: {COLORS['bg_medium']};
+                color: {COLORS['text_light']};
+                padding: 8px 16px;
+                border: 1px solid {COLORS['bg_light']};
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                margin-right: 2px;
+            }}
+            QTabBar::tab:selected, QTabBar::tab:hover {{
+                background: {COLORS['accent']};
+                color: {COLORS['bg_dark']};
+                font-weight: bold;
+            }}
+            QTabWidget::pane {{
+                border-top: 2px solid {COLORS['accent']};
+                top: -1px;
+            }}
+        """)
+
+        # 建立圖表元件
+        self.top_chart = ReturnChart()
+        self.bottom_chart = ReturnChart()
+
+        # 加入頁簽
+        self.chart_tabs.addTab(self.top_chart, "Top 20 報酬率")
+        self.chart_tabs.addTab(self.bottom_chart, "Bottom 20 報酬率")
+
+        return self.chart_tabs
+        
+    def refresh_data(self):
+        """刷新報酬率數據"""
+        self.refresh_btn.setEnabled(False)
+        self.status_label.setText("正在查詢數據...")
+        
+        # 獲取查詢參數
+        frequency = self.frequency_combo.currentText()
+        start_date = self.start_date.date().toString("yyyy-MM-dd")
+        end_date = self.end_date.date().toString("yyyy-MM-dd")
+        top_n = self.top_n_spin.value()
+        include_negative = self.include_negative_check.isChecked()
+        
+        # 啟動工作線程
+        self.worker = ReturnRankingWorker(
+            self.db_config, frequency, (start_date, end_date),
+            top_n, include_negative
+        )
+        
+        self.worker.progress_update.connect(self.update_status)
+        self.worker.result_ready.connect(self.display_results)
+        self.worker.error_occurred.connect(self.handle_error)
+        
+        self.worker.start()
+        
+    def display_results(self, df: pd.DataFrame):
+        """顯示查詢結果"""
+        self.current_df = df
+        self.refresh_btn.setEnabled(True)
+        
+        # 更新表格
+        self.ranking_table.setRowCount(0) # 清空表格
+        self.ranking_table.setRowCount(len(df))
+        
+        for i, (_, row) in enumerate(df.iterrows()):
+            # 排名
+            rank_item = QTableWidgetItem(str(i + 1))
+            rank_item.setTextAlignment(Qt.AlignCenter)
+            
+            # 股票代碼
+            ticker_item = QTableWidgetItem(row['ticker'])
+            
+            # 股票名稱
+            name_item = QTableWidgetItem(row['name'])
+            
+            # 最新報酬率
+            latest_return = row['latest_return_pct']
+            latest_return_item = QTableWidgetItem(f"{latest_return:.2f}")
+            latest_return_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            
+            # 設定顏色
+            if latest_return > 0:
+                latest_return_item.setForeground(QBrush(QColor(COLORS['gain'])))
+            elif latest_return < 0:
+                latest_return_item.setForeground(QBrush(QColor(COLORS['loss'])))
+            
+            # 平均報酬率
+            avg_return = row['avg_return_pct']
+            avg_return_item = QTableWidgetItem(f"{avg_return:.2f}")
+            avg_return_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            
+            if avg_return > 0:
+                avg_return_item.setForeground(QBrush(QColor(COLORS['gain'])))
+            elif avg_return < 0:
+                avg_return_item.setForeground(QBrush(QColor(COLORS['loss'])))
+            
+            # 數據點數
+            points_item = QTableWidgetItem(str(row['data_points']))
+            points_item.setTextAlignment(Qt.AlignCenter)
+            
+            # 最新日期
+            latest_date = pd.to_datetime(row['latest_date']).strftime('%Y-%m-%d')
+            date_item = QTableWidgetItem(latest_date)
+            
+            # 期間
+            first_date = pd.to_datetime(row['first_date']).strftime('%Y-%m-%d')
+            last_date = pd.to_datetime(row['last_date']).strftime('%Y-%m-%d')
+            period_item = QTableWidgetItem(f"{first_date} ~ {last_date}")
+            
+            # 設定表格項目
+            self.ranking_table.setItem(i, 0, rank_item)
+            self.ranking_table.setItem(i, 1, ticker_item)
+            self.ranking_table.setItem(i, 2, name_item)
+            self.ranking_table.setItem(i, 3, latest_return_item)
+            self.ranking_table.setItem(i, 4, avg_return_item)
+            self.ranking_table.setItem(i, 5, points_item)
+            self.ranking_table.setItem(i, 6, date_item)
+            self.ranking_table.setItem(i, 7, period_item)
+        
+        # 更新圖表
+        frequency_text = self.frequency_combo.currentText()
+        self.top_chart.update_chart(df.head(20), f"Top 20 {frequency_text} 報酬率")
+        self.bottom_chart.update_chart(df.tail(20), f"Bottom 20 {frequency_text} 報酬率")
+        
+        # 更新狀態
+        self.status_label.setText(f"查詢完成，共 {len(df)} 筆數據")
+        
+    def filter_table(self):
+        """過濾表格數據"""
+        search_text = self.search_input.text().lower()
+        
+        for row in range(self.ranking_table.rowCount()):
+            ticker = self.ranking_table.item(row, 1).text().lower()
+            name = self.ranking_table.item(row, 2).text().lower()
+            
+            if search_text in ticker or search_text in name:
+                self.ranking_table.setRowHidden(row, False)
+            else:
+                self.ranking_table.setRowHidden(row, True)
+                
+    def toggle_auto_refresh(self, checked):
+        """切換自動刷新"""
+        if checked:
+            self.auto_refresh_timer.start(300000)  # 5分鐘
+            self.status_label.setText("自動刷新已啟動 (每5分鐘)")
+        else:
+            self.auto_refresh_timer.stop()
+            self.status_label.setText("自動刷新已停止")
+            
+    def export_data(self):
+        """匯出數據"""
+        if self.current_df is None or self.current_df.empty:
+            QMessageBox.warning(self, "匯出錯誤", "沒有數據可供匯出")
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "匯出報酬率排行", "",
+            "CSV檔案 (*.csv);;Excel檔案 (*.xlsx)"
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            if file_path.endswith('.csv'):
+                self.current_df.to_csv(file_path, index=False, encoding='utf-8-sig')
+            else:
+                self.current_df.to_excel(file_path, index=False)
+                
+            QMessageBox.information(self, "匯出成功", f"數據已匯出至:\n{file_path}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "匯出錯誤", f"匯出失敗: {str(e)}")
+            
+    def update_status(self, message):
+        """更新狀態訊息"""
+        self.status_label.setText(message)
+        
+    def handle_error(self, error_message):
+        """處理錯誤"""
+        self.refresh_btn.setEnabled(True)
+        self.status_label.setText(f"錯誤: {error_message}")
+        QMessageBox.critical(self, "查詢錯誤", error_message)
+
+
+def main():
+    """主函數"""
+    app = QApplication(sys.argv)
+    
+    # 設定中文字體
+    font = QFont("Microsoft JhengHei", 10)
+    app.setFont(font)
+    
+    window = ReturnRankingWindow()
+    window.show()
+    
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
